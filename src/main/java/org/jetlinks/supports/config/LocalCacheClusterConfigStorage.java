@@ -1,26 +1,28 @@
 package org.jetlinks.supports.config;
 
 import com.google.common.collect.Maps;
-import lombok.AllArgsConstructor;
-import org.jctools.maps.NonBlockingHashMap;
 import org.jetlinks.core.Value;
 import org.jetlinks.core.Values;
 import org.jetlinks.core.cluster.ClusterCache;
+import org.jetlinks.core.config.ConfigKey;
 import org.jetlinks.core.config.ConfigStorage;
+import org.jetlinks.core.device.DeviceConfigKey;
 import org.jetlinks.core.event.EventBus;
 import org.jetlinks.core.utils.Reactors;
 import org.springframework.util.CollectionUtils;
+import org.springframework.util.ConcurrentReferenceHashMap;
 import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Function;
 
 import static org.jetlinks.supports.config.EventBusStorageManager.NOTIFY_TOPIC;
 
-@AllArgsConstructor
 public class LocalCacheClusterConfigStorage implements ConfigStorage {
     @SuppressWarnings("all")
     private static final AtomicReferenceFieldUpdater<Cache, Mono> CACHE_REF = AtomicReferenceFieldUpdater
@@ -32,16 +34,48 @@ public class LocalCacheClusterConfigStorage implements ConfigStorage {
     private static final AtomicReferenceFieldUpdater<Cache, Disposable> CACHE_LOADER = AtomicReferenceFieldUpdater
             .newUpdater(Cache.class, Disposable.class, "loader");
 
-    private final Map<String, Cache> caches = new NonBlockingHashMap<>();
+    private static final Map<Value, Value> shared = new ConcurrentReferenceHashMap<>(1024);
+
+    private static final Set<String> sharedKey = ConcurrentHashMap.newKeySet();
+
+    private final Map<String, Cache> caches;
     private final String id;
     private final EventBus eventBus;
 
     private final ClusterCache<String, Object> clusterCache;
 
-    private long expires;
+    private final long expires;
     private final Runnable doOnClear;
 
     public static final Value NULL = Value.simple(null);
+
+    public LocalCacheClusterConfigStorage(String id,
+                                          EventBus eventBus,
+                                          ClusterCache<String, Object> clusterCache,
+                                          long expires,
+                                          Runnable doOnClear,
+                                          Map<String, Cache> cacheContainer) {
+        this.id = id;
+        this.eventBus = eventBus;
+        this.clusterCache = clusterCache;
+        this.expires = expires;
+        this.doOnClear = doOnClear;
+        this.caches = cacheContainer;
+    }
+
+    public LocalCacheClusterConfigStorage(String id, EventBus eventBus,
+                                          ClusterCache<String, Object> clusterCache,
+                                          long expires,
+                                          Runnable doOnClear) {
+        this(id, eventBus, clusterCache, expires, doOnClear, new ConcurrentHashMap<>());
+    }
+
+    private static Value tryShare(String key, Value val) {
+        if (!sharedKey.contains(key)) {
+            return val;
+        }
+        return shared.computeIfAbsent(val, Function.identity());
+    }
 
     public class Cache {
         final String key;
@@ -97,8 +131,14 @@ public class LocalCacheClusterConfigStorage implements ConfigStorage {
             updateTime();
 
             CACHE_VERSION.incrementAndGet(this);
-            this.ref = Mono.justOrEmpty(value);
-            this.cached = value == null ? NULL : value;
+            if (value != null) {
+                value = tryShare(key, value);
+                this.ref = Mono.just(value);
+                this.cached = value;
+            } else {
+                this.ref = Mono.empty();
+                this.cached = NULL;
+            }
 
             dispose();
         }
@@ -350,5 +390,25 @@ public class LocalCacheClusterConfigStorage implements ConfigStorage {
     @Override
     public Mono<Void> refresh(Collection<String> keys) {
         return notify(CacheNotify.expires(id, keys));
+    }
+
+    static {
+
+        addSharedKey(DeviceConfigKey.productId);
+        addSharedKey(DeviceConfigKey.protocol);
+        addSharedKey(DeviceConfigKey.connectionServerId);
+        addSharedKey("state");
+        addSharedKey("productName");
+
+    }
+
+    public static void addSharedKey(ConfigKey<?>... key) {
+        for (ConfigKey<?> configKey : key) {
+            sharedKey.add(configKey.getKey());
+        }
+    }
+
+    public static void addSharedKey(String... key) {
+        sharedKey.addAll(Arrays.asList(key));
     }
 }

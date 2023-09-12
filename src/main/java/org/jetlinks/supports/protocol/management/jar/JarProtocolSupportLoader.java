@@ -11,14 +11,20 @@ import org.jetlinks.core.trace.ProtocolTracer;
 import org.jetlinks.core.utils.ClassUtils;
 import org.jetlinks.supports.protocol.management.ProtocolSupportDefinition;
 import org.jetlinks.supports.protocol.management.ProtocolSupportLoaderProvider;
+import org.jetlinks.supports.protocol.validator.MethodDeniedClassVisitor;
+import org.springframework.asm.ClassReader;
 import reactor.core.Exceptions;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.URL;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -30,6 +36,12 @@ public class JarProtocolSupportLoader implements ProtocolSupportLoaderProvider {
     private final Map<String, ProtocolClassLoader> protocolLoaders = new ConcurrentHashMap<>();
 
     private final Map<String, ProtocolSupportProvider> loaded = new ConcurrentHashMap<>();
+
+    protected final MethodDeniedClassVisitor visitor = MethodDeniedClassVisitor.global();
+
+    public JarProtocolSupportLoader() {
+
+    }
 
     @Override
     public String getProvider() {
@@ -98,16 +110,9 @@ public class JarProtocolSupportLoader implements ProtocolSupportLoaderProvider {
                                 .map(String::valueOf)
                                 .map(String::trim)
                                 .orElse(null);
-                        if (provider != null) {
-                            //直接从classLoad获取,防止冲突
-                            @SuppressWarnings("all")
-                            Class<ProtocolSupportProvider> providerType = (Class) loader.loadSelfClass(provider);
-                            supportProvider = providerType.getDeclaredConstructor().newInstance();
-                        } else {
-                            supportProvider = lookupProvider(loader);
-                            if (null == supportProvider) {
-                                return Mono.error(new IllegalArgumentException("error.protocol_provider_not_found"));
-                            }
+                        supportProvider = lookupProvider(provider, loader);
+                        if (null == supportProvider) {
+                            return Mono.error(new IllegalArgumentException("error.protocol_provider_not_found"));
                         }
                         ProtocolSupportProvider oldProvider = loaded.put(id, supportProvider);
                         try {
@@ -117,9 +122,7 @@ public class JarProtocolSupportLoader implements ProtocolSupportLoaderProvider {
                         } catch (Throwable e) {
                             log.error(e.getMessage(), e);
                         }
-                        return supportProvider
-                                .create(serviceContext)
-                                .onErrorMap(Exceptions::bubble);
+                        return supportProvider.create(serviceContext);
                     } catch (Throwable e) {
                         return Mono.error(e);
                     }
@@ -128,14 +131,30 @@ public class JarProtocolSupportLoader implements ProtocolSupportLoaderProvider {
                 .as(MonoTracer.create(ProtocolTracer.SpanName.install(id)));
     }
 
-    protected ProtocolSupportProvider lookupProvider(ProtocolClassLoader classLoader) {
+    @SneakyThrows
+    protected ProtocolSupportProvider lookupProvider(String provider,
+                                                     ProtocolClassLoader classLoader) {
 
-        return ClassUtils
+        ClassUtils.Scanner<ProtocolClassLoader> loaderScanner = ClassUtils
+                .createScanner(classLoader, "classpath:**/*.class", true);
+
+        loaderScanner.walkClass((loader, name, clazz) -> visitor.validate(name, clazz));
+
+        if (provider != null) {
+            //直接从classLoad获取,防止冲突
+            @SuppressWarnings("all")
+            Class<ProtocolSupportProvider> providerType = (Class) classLoader.loadSelfClass(provider);
+            return providerType.getDeclaredConstructor().newInstance();
+        }
+
+        return loaderScanner
                 .findImplClass(ProtocolSupportProvider.class,
-                               "classpath:**/*.class",
-                               true,
-                               classLoader,
-                               ProtocolClassLoader::loadSelfClass)
+                               this::loadProvider)
                 .orElse(null);
+    }
+
+    @SneakyThrows
+    protected Class<?> loadProvider(ProtocolClassLoader loader, String className, InputStream classStream) {
+        return loader.loadSelfClass(className);
     }
 }

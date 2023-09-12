@@ -1,5 +1,7 @@
 package org.jetlinks.supports.official;
 
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.serializer.SerializerFeature;
 import io.swagger.v3.oas.annotations.media.Schema;
 import lombok.Getter;
 import lombok.Setter;
@@ -8,6 +10,8 @@ import org.jetlinks.core.metadata.DataType;
 import org.jetlinks.core.metadata.types.*;
 import org.junit.Test;
 import org.springframework.core.ResolvableType;
+
+import java.util.List;
 
 import static org.junit.Assert.assertTrue;
 
@@ -19,6 +23,8 @@ public class MetadataParserTest {
 
         DataType type = DeviceMetadataParser.withType(ResolvableType.forType(TestClazz.class));
         assertTrue(type instanceof ObjectType);
+
+        System.out.println(JSON.toJSONString(type, SerializerFeature.PrettyFormat));
 
         ObjectType objectType = ((ObjectType) type);
 
@@ -48,6 +54,8 @@ public class MetadataParserTest {
 
     }
 
+
+
     @Getter
     @Setter
     static class TestClazz extends Generic<String> {
@@ -73,6 +81,11 @@ public class MetadataParserTest {
         @Schema(description = "name")
         private String name;
 
+        @Schema(description = "递归")
+        private TestClazz nest;
+
+        @Schema(description = "递归List")
+        private List<Entity> nestList;
     }
 
     @Getter
