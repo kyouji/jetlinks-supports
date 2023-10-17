@@ -68,11 +68,9 @@ public class JetLinksEventMetadata implements EventMetadata {
     @Override
     public DataType getType() {
         if (type == null && jsonObject != null) {
-            JSONObject typeJson = Optional.ofNullable(jsonObject.getJSONObject("valueType"))
-                                          .orElse(jsonObject.getJSONObject("type"));
+            JSONObject typeJson = jsonObject.getJSONObject("valueType");
 
-            type = Optional.ofNullable(typeJson)
-                           .map(json -> json.getString("type"))
+            type = Optional.ofNullable(typeJson.getString("type"))
                            .map(DataTypes::lookup)
                            .map(Supplier::get)
                            .orElseGet(UnknownType::new);
