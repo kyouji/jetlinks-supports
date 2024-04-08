@@ -40,6 +40,8 @@ import reactor.core.Exceptions;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.context.Context;
 import reactor.util.retry.Retry;
 import reactor.util.retry.RetryBackoffSpec;
@@ -56,6 +58,7 @@ import java.net.UnknownHostException;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -78,6 +81,8 @@ public class ScalecubeRpcManager implements RpcManager {
     private ExtendedCluster cluster;
 
     private ServiceCall serviceCall;
+
+    private Scheduler requestScheduler =Schedulers.parallel();
 
     private static final RetryBackoffSpec DEFAULT_RETRY = Retry
         .backoff(12, Duration.ofMillis(100))
@@ -223,6 +228,13 @@ public class ScalecubeRpcManager implements RpcManager {
             public void onMembershipEvent(MembershipEvent event) {
                 if (event.isLeaving() || event.isRemoved()) {
                     memberLeave(event.member());
+                    Schedulers
+                        .parallel()
+                        .schedule(() -> {
+                            if (cluster.member(event.member().id()).isPresent()) {
+                                syncRegistration(event.member());
+                            }
+                        }, 5, TimeUnit.SECONDS);
                 }
                 if (event.isAdded() || event.isUpdated()) {
                     syncRegistration(event.member());
@@ -720,11 +732,13 @@ public class ScalecubeRpcManager implements RpcManager {
                                 case FIRE_AND_FORGET:
                                     return toServiceMessage(methodInfo, request)
                                         .flatMap(serviceCall::oneWay)
+                                        .subscribeOn(requestScheduler)
                                         .retryWhen(getRetry(method));
 
                                 case REQUEST_RESPONSE:
                                     return toServiceMessage(methodInfo, request)
                                         .flatMap(msg -> serviceCall.requestOne(msg, returnType))
+                                        .subscribeOn(requestScheduler)
                                         .transform(asMono(isServiceMessage))
                                         .retryWhen(getRetry(method));
 
@@ -732,6 +746,7 @@ public class ScalecubeRpcManager implements RpcManager {
 
                                     return toServiceMessage(methodInfo, request)
                                         .flatMapMany(msg -> serviceCall.requestMany(msg, returnType))
+                                        .subscribeOn(requestScheduler)
                                         .transform(asFlux(isServiceMessage))
                                         .retryWhen(getRetry(method));
 
@@ -744,6 +759,7 @@ public class ScalecubeRpcManager implements RpcManager {
                                             Flux.from((Publisher) request)
                                                 .flatMap(data -> toServiceMessage(methodInfo, data)),
                                             returnType)
+                                        .subscribeOn(requestScheduler)
                                         .transform(asFlux(isServiceMessage))
                                         .retryWhen(getRetry(method));
 

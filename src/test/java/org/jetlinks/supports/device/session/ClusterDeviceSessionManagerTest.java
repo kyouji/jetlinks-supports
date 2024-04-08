@@ -5,6 +5,7 @@ import io.scalecube.cluster.ClusterConfig;
 import io.scalecube.services.transport.rsocket.RSocketServiceTransport;
 import io.scalecube.transport.netty.tcp.TcpTransportFactory;
 import lombok.SneakyThrows;
+import org.jctools.maps.NonBlockingHashMap;
 import org.jetlinks.core.device.DeviceInfo;
 import org.jetlinks.core.device.DeviceOperator;
 import org.jetlinks.core.device.DeviceRegistry;
@@ -18,12 +19,16 @@ import org.jetlinks.supports.test.InMemoryDeviceRegistry;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
+import reactor.core.Disposable;
 import reactor.core.Disposables;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 import java.time.Duration;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class ClusterDeviceSessionManagerTest {
@@ -37,16 +42,16 @@ public class ClusterDeviceSessionManagerTest {
     @SneakyThrows
     public void init() {
         ExtendedClusterImpl cluster1 = new ExtendedClusterImpl(
-                ClusterConfig.defaultConfig()
-                             .transport(conf -> conf.transportFactory(new TcpTransportFactory()))
+            ClusterConfig.defaultConfig()
+                         .transport(conf -> conf.transportFactory(new TcpTransportFactory()))
         );
         cluster1.startAwait();
 
 
         ExtendedClusterImpl cluster2 = new ExtendedClusterImpl(
-                ClusterConfig.defaultConfig()
-                             .transport(conf -> conf.transportFactory(new TcpTransportFactory()))
-                             .membership(ship -> ship.seedMembers(cluster1.address()))
+            ClusterConfig.defaultConfig()
+                         .transport(conf -> conf.transportFactory(new TcpTransportFactory()))
+                         .membership(ship -> ship.seedMembers(cluster1.address()))
         );
         cluster2.startAwait();
 
@@ -60,7 +65,7 @@ public class ClusterDeviceSessionManagerTest {
 
         manager1.init();
         manager2.init();
-        Thread.sleep(1000);
+        Thread.sleep(2000);
 
         registry = InMemoryDeviceRegistry.create();
 
@@ -79,42 +84,48 @@ public class ClusterDeviceSessionManagerTest {
     }
 
     @Test
+    @SneakyThrows
     public void testRegisterInMulti() {
         LostDeviceSession session = new LostDeviceSession("test", device, DefaultTransport.MQTT) {
             @Override
             public boolean isAlive() {
                 return true;
             }
+
             @Override
             public Mono<Boolean> isAliveAsync() {
                 return Reactors.ALWAYS_TRUE;
             }
         };
         AtomicInteger eventCount = new AtomicInteger();
-        Disposables.composite(
-                manager1.listenEvent(event -> {
-                    if (event.isClusterExists()) {
-                        return Mono.empty();
-                    }
-                    eventCount.incrementAndGet();
+        Disposable disposable = Disposables.composite(
+            manager1.listenEvent(event -> {
+                System.err.println(event.getType()+ " manager 1: " + event.isClusterExists());
+                if (event.isClusterExists()) {
                     return Mono.empty();
-                }),
-                manager2.listenEvent(event -> {
-                    if (event.isClusterExists()) {
-                        return Mono.empty();
-                    }
-                    eventCount.incrementAndGet();
+                }
+                eventCount.incrementAndGet();
+                return Mono.empty();
+            }),
+            manager2.listenEvent(event -> {
+                System.err.println(event.getType()+ " manager 2: " + event.isClusterExists());
+                if (event.isClusterExists()) {
                     return Mono.empty();
-                })
+                }
+                eventCount.incrementAndGet();
+                return Mono.empty();
+            })
         );
 
-        manager1.compute(session.getDeviceId(), mono -> Mono.just(session))
-                .block();
-        manager1.compute(session.getDeviceId(), mono -> Mono.just(session))
-                .block();
+        Flux.concat(
+                manager1.compute(session.getDeviceId(), mono -> Mono.just(session)),
+                manager1.compute(session.getDeviceId(), mono -> Mono.just(session))
+            )
+            .blockLast();
+        Thread.sleep(1000);
         manager2.compute(session.getDeviceId(), Mono.just(session), null)
                 .block();
-
+        Thread.sleep(1000);
         Assert.assertEquals(1, eventCount.get());
         eventCount.set(0);
         manager1.remove(device.getDeviceId(), false)
@@ -128,7 +139,38 @@ public class ClusterDeviceSessionManagerTest {
             .as(StepVerifier::create)
             .expectComplete()
             .verify();
+        disposable.dispose();
 
+    }
+
+    @Test
+    public void testRegisterRecursive() {
+        LostDeviceSession session = new LostDeviceSession("test", device, DefaultTransport.MQTT) {
+            @Override
+            public boolean isAlive() {
+                return true;
+            }
+
+            @Override
+            public Mono<Boolean> isAliveAsync() {
+                return Reactors.ALWAYS_TRUE;
+            }
+        };
+
+        manager1.compute(session.getDeviceId(), mono -> {
+                    return Mono
+                        .delay(Duration.ofSeconds(1))
+                        .then(Mono.defer(() -> manager1
+                            .getSession(session.getDeviceId())))
+                        .thenReturn(session);
+                })
+                .block();
+
+        manager1
+            .getSession(session.getDeviceId())
+            .as(StepVerifier::create)
+            .expectNext(session)
+            .verifyComplete();
 
     }
 
@@ -155,13 +197,74 @@ public class ClusterDeviceSessionManagerTest {
 
         Duration time = Flux.range(0, 20000)
                             .flatMap(i -> manager2
-                                    .isAlive(session.getDeviceId()))
+                                .isAlive(session.getDeviceId()))
                             .as(StepVerifier::create)
                             .expectNextCount(20000)
                             .verifyComplete();
         System.out.println(time);
 
         manager2.getSessionInfo()
+                .as(StepVerifier::create)
+                .expectNextCount(1)
+                .verifyComplete();
+    }
+
+    @Test
+    public void testRemoveWhenRegister() {
+        LostDeviceSession session = new LostDeviceSession("test", device, DefaultTransport.MQTT) {
+            @Override
+            public boolean isAlive() {
+                return true;
+            }
+
+            @Override
+            public Mono<Boolean> isAliveAsync() {
+                return Reactors.ALWAYS_TRUE;
+            }
+        };
+        manager1.compute(
+                    session.getDeviceId(),
+                    old -> old
+                        .then(manager1.remove(session.getDeviceId(), true))
+                        .thenReturn(session))
+                .as(StepVerifier::create)
+                .expectNextCount(1)
+                .verifyComplete();
+
+        manager1.compute(
+                    session.getDeviceId(),
+                    old -> old
+                        .then(manager1.remove(session.getDeviceId(), true))
+                        .thenReturn(session))
+                .as(StepVerifier::create)
+                .expectNextCount(1)
+                .verifyComplete();
+    }
+
+    @Test
+    public void testRemoveWhenGet() {
+        AtomicBoolean alive = new AtomicBoolean(true);
+        LostDeviceSession session = new LostDeviceSession("test", device, DefaultTransport.MQTT) {
+            @Override
+            public boolean isAlive() {
+                return alive.get();
+            }
+
+        };
+        manager1.compute(
+                    session.getDeviceId(),
+                    old -> Mono.just(session))
+                .as(StepVerifier::create)
+                .expectNextCount(1)
+                .verifyComplete();
+        alive.set(false);
+
+        manager1.compute(
+                    session.getDeviceId(),
+                    old -> manager1
+                        .getSession(session.getDeviceId())
+                        .then(Mono.fromRunnable(()->alive.set(true)))
+                        .thenReturn(session))
                 .as(StepVerifier::create)
                 .expectNextCount(1)
                 .verifyComplete();
